@@ -12,8 +12,7 @@ import webbrowser
 app = Flask(__name__)
 CORS(app)
 
-# Configuration
-DUPLICATES_FOLDER_NAME = "Duplicates"
+
 
 def authenticate_google_drive(access_token):
     """Verify the access token and create Google Drive service"""
@@ -32,66 +31,46 @@ def save_token():
     if not access_token:
         return jsonify({'error': 'No access token provided'}), 400
 
-    print(f"Received Google Token: {access_token}")  # Log partial token
+    print(f"Received Google Token: {access_token}") 
     return jsonify({'message': 'Token received successfully'})
 
-@app.route('/run-deduplication', methods=['POST'])
-def run_deduplication():
+@app.route('/run_duplication', methods=['POST'])
+def run_duplication():
     data = request.json
     access_token = data.get('accessToken')
-    
+    folder_name = data.get('folderName')
+
     if not access_token:
         return jsonify({'error': 'No access token provided'}), 400
-    
+    if not folder_name:
+        return jsonify({'error': 'No folder name provided'}), 400
+
     try:
+        # Authenticate using the access token
         service = authenticate_google_drive(access_token)
-        if not service:
-            return jsonify({'error': 'Google authentication failed'}), 500
+        query = f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'"
+        results = service.files().list(q=query).execute()
+        folders = results.get('files', [])
+
+        if not folders:
+            return jsonify({'error': 'Folder not found'}), 404
+
+        folder_id = folders[0]['id']
+
+       
+        subprocess.run(['python3', 'duplication.py', folder_id, access_token], check=True)
+
         
-        print("Google Drive authentication successful")
-        
-        # Create temp directory
-        temp_dir = tempfile.mkdtemp()
-        print(f"Created temp directory: {temp_dir}")
-        
-        # Run deduplication
-        result = subprocess.run(
-            [sys.executable, 'deduplication.py', access_token, temp_dir],
-            capture_output=True,
-            text=True
-        )
-        
-        print("\n=== Process Output ===")
-        print(f"Return code: {result.returncode}")
-        print(f"stdout:\n{result.stdout}")
-        if result.returncode != 0:
-            print(f"stderr:\n{result.stderr}")
-            raise Exception(result.stderr or "Deduplication failed")
-        
-        # Parse output for duplicates count
-        duplicates_found = 0
-        for line in result.stdout.split('\n'):
-            if "duplicate pairs" in line.lower():
-                duplicates_found = int(line.split()[0])
-                break
-        
-        return jsonify({
-            'message': 'Deduplication completed successfully',
-            'duplicates_found': duplicates_found
-        })
-        
+        folder_url = f'https://drive.google.com/drive/folders/{folder_id}'
+        webbrowser.open(folder_url) 
+
+        return jsonify({'success': True, 'folderId': folder_id, 'folderUrl': folder_url})
+
     except Exception as e:
-        print(f"\n=== ERROR ===")
-        print(f"Type: {type(e).__name__}")
-        print(f"Details: {str(e)}")
-        return jsonify({
-            'error': 'Deduplication failed',
-            'details': str(e)
-        }), 500
-    finally:
-        if 'temp_dir' in locals():
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            print(f"Cleaned up temp directory: {temp_dir}")
+        print(f"Error during duplication: {str(e)}")
+        return jsonify({'error': 'Failed to identify duplicates', 'details': str(e)}), 500
+
+
 @app.route('/list-folders', methods=['POST'])
 def list_folders():
     data = request.json
@@ -147,12 +126,12 @@ def categorize():
 
         folder_id = folders[0]['id']
 
-        # 🧠 Run categorization.py with folder_id and access_token
+  
         subprocess.run(['python3', 'categorization.py', folder_id, access_token], check=True)
 
-    #📂 Open the folder in a browser (or send URL back to frontend)
+   
         folder_url = f'https://drive.google.com/drive/folders/{folder_id}'
-        webbrowser.open(folder_url)  # Optional: Only opens server-side
+        webbrowser.open(folder_url)  
 
         return jsonify({'success': True, 'folderId': folder_id, 'folderUrl': folder_url})
 
@@ -163,3 +142,4 @@ def categorize():
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
+
