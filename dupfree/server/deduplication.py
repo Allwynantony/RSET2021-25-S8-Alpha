@@ -1,317 +1,182 @@
 import os
-import sys
-import time
-import cv2
+import shutil
 import numpy as np
+import cv2
 import imagehash
 from PIL import Image
+import sys
+import io
+import webbrowser
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseDownload, MediaFileUpload
 
-# Configuration
-THRESHOLD = 0.55
-SIFT_THRESHOLD = 0.3
-HASH_SIZE = 32
-BANDS = 75
-DUPLICATES_FOLDER_NAME = "duplicates"
-MAX_DUPLICATES_TO_UPLOAD = 50
+# Authentication
+def authenticate_google_drive(token):
+    creds = Credentials(token)
+    return build('drive', 'v3', credentials=creds)
 
-def find_duplicates(image_paths):
-    """Find duplicate images using pHash and SIFT"""
-    print("\n[STATUS] Finding duplicate images...")
-    
-    # Load and resize images
+#Downloading the images
+def download_images_from_drive(service, folder_id, download_path):
+    if os.path.exists(download_path):
+        shutil.rmtree(download_path)
+    os.makedirs(download_path)
+
+    query = f"'{folder_id}' in parents and mimeType contains 'image/'"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    items = results.get('files', [])
+
+    for item in items:
+        request = service.files().get_media(fileId=item['id'])
+        file_path = os.path.join(download_path, item['name'])
+        with io.FileIO(file_path, 'wb') as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+    return download_path
+
+# List images tht is in folder
+def list_images_from_folder(folder_path):
+    return [os.path.join(folder_path, f)
+            for f in os.listdir(folder_path)
+            if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp', '.avif', '.heic'))]
+
+# Load images and resize
+def load_images_resized(image_files, target_size=(256, 256)):
     images = []
-    valid_paths = []
-    for path in image_paths:
-        try:
-            with Image.open(path) as img:
-                img = img.convert('RGB')
-                img = img.resize((256, 256))
-                images.append(np.array(img))
-                valid_paths.append(path)
-        except Exception as e:
-            print(f"[WARNING] Error loading {os.path.basename(path)}: {str(e)}")
-            continue
-    
-    if len(images) < 2:
-        print("[STATUS] Not enough valid images to compare")
-        return []
+    for file_path in image_files:
+        image = Image.open(file_path).convert('RGB')
+        image = image.resize(target_size)
+        images.append(np.array(image))
+    return np.array(images)
 
-    processed_pairs = set()
-    duplicates = []
-    
-    # pHash comparison
-    print("[STATUS] Running pHash comparison...")
+#Preprocess & Signature 
+def preprocess_image(image: np.ndarray, hash_size: int) -> np.ndarray:
+    return cv2.resize(image, (hash_size, hash_size))
+
+def calculate_signature(image_array: np.ndarray, hash_size: int) -> np.ndarray:
+    image_array = np.nan_to_num(image_array, nan=0.0)
+    image_array = (image_array * 255).astype(np.uint8)
+    pil_image = Image.fromarray(image_array).convert("L").resize(
+        (hash_size, hash_size), Image.LANCZOS)
+    phash = imagehash.phash(pil_image, hash_size=hash_size)
+    signature = phash.hash.flatten()
+    pil_image.close()
+    return signature
+
+# Duplicate Detection 
+def find_near_duplicates(images, threshold, hash_size, bands, processed_pairs):
+    rows = int(hash_size ** 2 / bands)
     signatures = {}
-    for idx, img in enumerate(images):
-        try:
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-            resized = cv2.resize(gray, (HASH_SIZE, HASH_SIZE))
-            phash = imagehash.phash(Image.fromarray(resized), hash_size=HASH_SIZE)
-            signatures[idx] = phash
-        except Exception as e:
-            print(f"[WARNING] Error processing image {idx}: {str(e)}")
+    hash_buckets_list = [{} for _ in range(bands)]
+
+    for idx, image in enumerate(images):
+        preprocessed = preprocess_image(image, hash_size)
+        signature = calculate_signature(preprocessed, hash_size)
+        signatures[idx] = np.packbits(signature)
+
+        for i in range(bands):
+            band = signature[i * rows: (i + 1) * rows]
+            band_bytes = band.tobytes()
+            hash_buckets_list[i].setdefault(band_bytes, []).append(idx)
+
+    candidate_pairs = {
+        (a, b) for bucket in hash_buckets_list
+        for group in bucket.values() if len(group) > 1
+        for i, a in enumerate(group) for b in group[i + 1:]
+    }
+
+    near_duplicates = []
+    for idx_a, idx_b in candidate_pairs:
+        if (idx_a, idx_b) in processed_pairs or (idx_b, idx_a) in processed_pairs:
             continue
-    
-    # Compare signatures
-    for i in range(len(images)):
-        for j in range(i+1, len(images)):
-            if (i,j) in processed_pairs:
-                continue
-                
-            if i in signatures and j in signatures and signatures[i] - signatures[j] < 10:
-                duplicates.append((i,j))
-                processed_pairs.add((i,j))
-                print(f"[MATCH] pHash: {os.path.basename(valid_paths[i])} ↔ {os.path.basename(valid_paths[j])}")
-    
-    # SIFT comparison for remaining images
-    print("[STATUS] Running SIFT comparison...")
+        a, b = np.unpackbits(signatures[idx_a]), np.unpackbits(signatures[idx_b])
+        similarity = (hash_size**2 - np.count_nonzero(a != b)) / (hash_size**2)
+        if similarity >= threshold:
+            near_duplicates.append((idx_a, idx_b))
+            processed_pairs.update({(idx_a, idx_b), (idx_b, idx_a)})
+
+    return near_duplicates
+
+# === SIFT Duplicate Check ===
+def sift_similarity(img1, img2, threshold=0.3):
     sift = cv2.SIFT_create()
-    for i in range(len(images)):
-        for j in range(i+1, len(images)):
-            if (i,j) in processed_pairs:
-                continue
-                
-            try:
-                img1 = cv2.cvtColor(images[i], cv2.COLOR_RGB2GRAY)
-                img2 = cv2.cvtColor(images[j], cv2.COLOR_RGB2GRAY)
-                
-                kp1, des1 = sift.detectAndCompute(img1, None)
-                kp2, des2 = sift.detectAndCompute(img2, None)
-                
-                if des1 is None or des2 is None:
-                    continue
-                
-                bf = cv2.BFMatcher()
-                matches = bf.knnMatch(des1, des2, k=2)
-                
-                good = []
-                for m,n in matches:
-                    if m.distance < 0.75*n.distance:
-                        good.append(m)
-                
-                similarity = len(good) / min(len(kp1), len(kp2)) if min(len(kp1), len(kp2)) > 0 else 0
-                if similarity > SIFT_THRESHOLD:
-                    duplicates.append((i,j))
-                    processed_pairs.add((i,j))
-                    print(f"[MATCH] SIFT: {os.path.basename(valid_paths[i])} ↔ {os.path.basename(valid_paths[j])} (similarity: {similarity:.2f})")
-            except Exception as e:
-                print(f"[WARNING] Error comparing images: {str(e)}")
-                continue
-    
-    return [(valid_paths[i], valid_paths[j]) for i,j in duplicates]
+    kp1, des1 = sift.detectAndCompute(cv2.cvtColor(img1, cv2.COLOR_RGB2GRAY), None)
+    kp2, des2 = sift.detectAndCompute(cv2.cvtColor(img2, cv2.COLOR_RGB2GRAY), None)
+    if des1 is None or des2 is None:
+        return False
+    bf = cv2.BFMatcher()
+    matches = bf.knnMatch(des1, des2, k=2)
+    good = [m for m, n in matches if m.distance < 0.75 * n.distance]
+    return len(good) / min(len(kp1), len(kp2)) >= threshold if kp1 and kp2 else False
 
-def save_duplicates_to_drive(service, duplicates, image_paths, parent_id):
-    """Save duplicate pairs to Google Drive with robust error handling"""
-    print("\n[STATUS] Saving duplicates to Google Drive...")
-    
-    folder_id = None
-    max_retries = 3
-    retry_delay = 5
-    
-    # Try to create folder with retries
-    for attempt in range(max_retries):
-        try:
-            folder_metadata = {
-                'name': DUPLICATES_FOLDER_NAME,
-                'mimeType': 'application/vnd.google-apps.folder',
-                'parents': [parent_id]
-            }
-            folder = service.files().create(body=folder_metadata, fields='id').execute()
-            folder_id = folder.get('id')
-            print("[SUCCESS] Created duplicates folder")
-            break
-        except HttpError as e:
-            if attempt < max_retries - 1:
-                print(f"[RETRY] Folder creation failed (attempt {attempt+1}), retrying...")
-                time.sleep(retry_delay)
-            else:
-                print("[WARNING] Failed to create folder after multiple attempts")
-    
-    # If still no folder, try to find existing
-    if not folder_id:
-        try:
-            existing_query = f"name='{DUPLICATES_FOLDER_NAME}' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder'"
-            existing = service.files().list(q=existing_query, fields="files(id)").execute().get('files', [])
-            if existing:
-                folder_id = existing[0]['id']
-                print("[SUCCESS] Found existing duplicates folder")
-            else:
-                print("[ERROR] Could not create or find duplicates folder")
-                return 0
-        except Exception as e:
-            print(f"[ERROR] Failed to find existing folder: {str(e)}")
-            return 0
-    
-    # Upload duplicates
-    uploaded_count = 0
-    total_pairs = min(len(duplicates), MAX_DUPLICATES_TO_UPLOAD)
-    
-    print(f"\n[STATUS] Uploading {total_pairs} duplicate pairs:")
-    for pair_num, (path1, path2) in enumerate(duplicates[:MAX_DUPLICATES_TO_UPLOAD], 1):
-        try:
-            print(f"  Pair {pair_num}/{total_pairs}: {os.path.basename(path1)} and {os.path.basename(path2)}")
-            
-            for img_num, path in enumerate([path1, path2], 1):
-                file_metadata = {
-                    'name': f"pair{pair_num}_dup{img_num}_{os.path.basename(path)}",
-                    'parents': [folder_id]
-                }
-                
-                media = MediaFileUpload(
-                    path,
-                    mimetype='image/jpeg',
-                    resumable=True
-                )
-                
-                # Upload with retry
-                for upload_attempt in range(2):
-                    try:
-                        service.files().create(
-                            body=file_metadata,
-                            media_body=media,
-                            fields='id'
-                        ).execute()
-                        break
-                    except Exception as e:
-                        if upload_attempt == 0:
-                            print(f"    [RETRY] Upload failed, retrying...")
-                            time.sleep(2)
-                        else:
-                            raise
-            
-            uploaded_count += 1
-        except Exception as e:
-            print(f"  [ERROR] Failed to upload pair {pair_num}: {str(e)}")
-            continue
-    
-    print(f"\n[RESULT] Successfully uploaded {uploaded_count} duplicate pairs")
-    return uploaded_count
+# === Save Duplicate Pairs ===
+def save_duplicate_pairs(duplicates, image_files, output_folder):
+    if os.path.exists(output_folder):
+        shutil.rmtree(output_folder)
+    os.makedirs(output_folder)
+    for i, (a, b) in enumerate(duplicates, 1):
+        Image.open(image_files[a]).convert("RGB").save(os.path.join(output_folder, f"{i}_dup_1.jpg"))
+        Image.open(image_files[b]).convert("RGB").save(os.path.join(output_folder, f"{i}_dup_2.jpg"))
 
-def main(access_token, temp_dir):
-    """Main deduplication function"""
-    try:
-        print("\n=== IMAGE DEDUPLICATION TOOL ===")
-        
-        # Authenticate
-        print("\n[1/6] Authenticating with Google Drive API...")
-        creds = Credentials(access_token)
-        service = build('drive', 'v3', credentials=creds, static_discovery=False)
-        print("[SUCCESS] Authentication successful")
-        
-        # Find target folder
-        print("\n[2/6] Locating 'Final Year Project' folder...")
-        folder_query = "name='Final Year Project' and mimeType='application/vnd.google-apps.folder'"
-        folders = service.files().list(q=folder_query, fields="files(id,name)").execute().get('files', [])
-        
-        if not folders:
-            raise Exception("'Final Year Project' folder not found")
-        
-        parent_id = folders[0]['id']
-        print("[SUCCESS] Found parent folder")
-        
-        # Find images dataset folder
-        print("\n[3/6] Locating 'imagedatasetAdi' folder...")
-        dataset_query = f"name='imagedatasetAdi' and '{parent_id}' in parents and mimeType='application/vnd.google-apps.folder'"
-        dataset_folders = service.files().list(q=dataset_query, fields="files(id,name)").execute().get('files', [])
-        
-        if not dataset_folders:
-            raise Exception("'imagedatasetAdi' folder not found")
-        
-        dataset_id = dataset_folders[0]['id']
-        print("[SUCCESS] Found dataset folder")
-        
-        # List all images
-        print("\n[4/6] Scanning for images...")
-        images = service.files().list(
-            q=f"'{dataset_id}' in parents and (mimeType contains 'image/' or mimeType contains 'application/octet-stream')",
-            fields="files(id,name,mimeType)",
-            pageSize=1000
-        ).execute().get('files', [])
-        
-        if not images:
-            raise Exception("No images found in the dataset folder")
-        
-        print(f"[SUCCESS] Found {len(images)} images")
-        
-        # Create temp directory
-        print("\n[5/6] Preparing temporary directory...")
-        os.makedirs(temp_dir, exist_ok=True)
-        
-        # Download images
-        print("\n[STATUS] Downloading images:")
-        image_paths = []
-        for idx, img in enumerate(images):
-            try:
-                img_path = os.path.join(temp_dir, img['name'])
-                request = service.files().get_media(fileId=img['id'])
-                
-                with open(img_path, 'wb') as f:
-                    f.write(request.execute())
-                
-                # Verify image
-                try:
-                    with Image.open(img_path) as test_img:
-                        test_img.verify()
-                    image_paths.append(img_path)
-                    print(f"  Downloaded {idx+1}/{len(images)}: {img['name']}")
-                except:
-                    print(f"  [WARNING] Skipping corrupted image: {img['name']}")
-                    os.remove(img_path)
-            except Exception as e:
-                print(f"  [ERROR] Failed to download {img['name']}: {str(e)}")
-                continue
-        
-        if not image_paths:
-            raise Exception("No valid images could be processed")
-        
-        print(f"\n[SUCCESS] Downloaded {len(image_paths)} valid images")
-        
-        # Find duplicates
-        print("\n[6/6] Finding duplicates...")
-        duplicates = find_duplicates(image_paths)
-        
-        if duplicates:
-            print(f"\n[RESULT] Found {len(duplicates)} duplicate pairs")
-            uploaded_count = save_duplicates_to_drive(service, duplicates, image_paths, dataset_id)
-            print(f"[SUMMARY] Uploaded {uploaded_count} duplicate pairs to Drive")
-        else:
-            print("\n[RESULT] No duplicates found")
-        
-        return len(duplicates)
-        
-    except Exception as e:
-        print(f"\n[ERROR] Deduplication failed: {str(e)}")
-        raise
-    finally:
-        # Clean up temp directory
-        if 'temp_dir' in locals():
-            try:
-                for filename in os.listdir(temp_dir):
-                    file_path = os.path.join(temp_dir, filename)
-                    try:
-                        if os.path.isfile(file_path):
-                            os.unlink(file_path)
-                    except Exception as e:
-                        print(f"[WARNING] Could not delete {file_path}: {str(e)}")
-                print("[STATUS] Cleaned up temporary files")
-            except Exception as e:
-                print(f"[WARNING] Temp directory cleanup failed: {str(e)}")
+# === Upload to Drive ===
+def upload_duplicates_to_drive(service, local_folder, parent_folder_id):
+    # Create subfolder in Drive
+    file_metadata = {
+        'name': 'duplicates',
+        'mimeType': 'application/vnd.google-apps.folder',
+        'parents': [parent_folder_id]
+    }
+    duplicate_folder = service.files().create(body=file_metadata, fields='id').execute()
+    duplicate_folder_id = duplicate_folder.get('id')
 
+    for file_name in os.listdir(local_folder):
+        file_path = os.path.join(local_folder, file_name)
+        media = MediaFileUpload(file_path, mimetype='image/jpeg')
+        service.files().create(
+            body={'name': file_name, 'parents': [duplicate_folder_id]},
+            media_body=media,
+            fields='id'
+        ).execute()
+
+    return duplicate_folder_id
+
+# === Main ===
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python deduplication.py <access_token> <temp_dir>")
-        sys.exit(1)
-    
-    try:
-        duplicates_count = main(sys.argv[1], sys.argv[2])
-        print("\n=== PROCESS COMPLETED ===")
-        print(f"Total duplicate pairs found: {duplicates_count}")
-        sys.exit(0)
-    except Exception as e:
-        print("\n=== PROCESS FAILED ===")
-        print(f"Error: {str(e)}")
-        sys.exit(1)
+    folder_id = sys.argv[1]
+    access_token = sys.argv[2]
+
+    service = authenticate_google_drive(access_token)
+    local_path = "/tmp/drive_images"
+    download_images_from_drive(service, folder_id, local_path)
+
+    image_files = list_images_from_folder(local_path)
+    images = load_images_resized(image_files)
+
+    threshold = 0.55
+    sift_threshold = 0.3
+    hash_size = 32
+    bands = 75
+    processed_pairs = set()
+
+    duplicates = find_near_duplicates(images, threshold, hash_size, bands, processed_pairs)
+
+    for i in range(len(images)):
+        for j in range(i + 1, len(images)):
+            if (i, j) in processed_pairs or (j, i) in processed_pairs:
+                continue
+            if sift_similarity(images[i], images[j], sift_threshold):
+                duplicates.append((i, j))
+                processed_pairs.update({(i, j), (j, i)})
+
+    output_folder = os.path.join(local_path, "duplicates")
+    save_duplicate_pairs(duplicates, image_files, output_folder)
+
+    if duplicates:
+        dup_folder_id = upload_duplicates_to_drive(service, output_folder, folder_id)
+        dup_url = f"https://drive.google.com/drive/folders/{dup_folder_id}"
+        #webbrowser.open_new_tab(dup_url)
+        print(f"Duplicate images uploaded to: {dup_url}")
+    else:
+        print("No duplicates found.")
