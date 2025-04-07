@@ -81,10 +81,6 @@ def categorize_files_with_clip(service, folder_id):
 
     print("\n✅ Classification and copying completed!")
 
-    # Open the main folder in the browser
-    #folder_url = f"https://drive.google.com/drive/folders/{folder_id}"""
-    #webbrowser.open(folder_url)
-
 if __name__ == "__main__":
     if len(sys.argv) < 3:
         print("Usage: python categorization.py <folder_id> <access_token>")
